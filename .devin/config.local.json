@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(ls)",
+      "Exec(pdftotext)",
+      "Exec(wc)",
+      "Exec(cp)",
+      "Exec(rm)",
+      "Exec(npm run)",
+      "Exec(adb devices)",
+      "Exec(\"C:/Users/Woo/.vela/sdk/emulator/windows-x86_64/emulator.exe\")",
+      "Exec(mkdir)",
+      "Exec(./gradlew)",
+      "Exec(java)",
+      "Exec(\"C:/Program Files/Android/Android Studio/jbr/bin/java\")",
+      "Exec(find)",
+      "Exec(adb)",
+      "Exec(grep)",
+      "Exec(./gradlew.bat)",
+      "Exec(cmd)",
+      "Exec(head)",
+      "Exec(tail)",
+      "Exec(powershell)"
+    ]
+  }
+}

@@ -1,0 +1,412 @@
+<template>
+  <div class="page">
+    <!-- Батарея: большое число + прогресс-бар -->
+    <div class="bat-block">
+      <div class="bat-header">
+        <text class="bat-label">BATTERY</text>
+        <text class="bat-value">{{ battery }}</text>
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill" style="width: {{ batteryBarWidth }}; background-color: {{ batteryColor }};"></div>
+      </div>
+    </div>
+
+    <!-- Network + IP -->
+    <div class="info-block">
+      <div class="info-row">
+        <text class="info-net">{{ network }}</text>
+      </div>
+      <div class="info-row">
+        <text class="info-ip">{{ ip }}</text>
+      </div>
+    </div>
+
+    <!-- Индикатор состояния: цветной круг + текст -->
+    <div class="status-block">
+      <div class="dot {{ statusDotClass }}"></div>
+      <div class="status-text-box">
+        <text class="status-text">{{ statusLine }}</text>
+      </div>
+    </div>
+
+    <!-- Кнопки -->
+    <div class="btn-row">
+      <div class="btn-main" onclick="handleRequestUpdate">
+        <text class="btn-main-text">Refresh</text>
+      </div>
+      <div class="btn-ghost" onclick="handleCreateConn">
+        <text class="btn-ghost-text">Reconnect</text>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+import interconnect from "@system.interconnect"
+
+let conn = null
+let lastUpdateTs = 0
+let ageTimer = null
+
+export default {
+  private: {
+    statusText: "idle",
+    statusClass: "status-idle",
+    statusDotClass: "dot-idle",
+    battery: "--",
+    batteryPct: 0,
+    network: "no data",
+    ip: "--",
+    age: "--"
+  },
+
+  computed: {
+    batteryBarWidth() {
+      const p = Math.max(0, Math.min(100, this.batteryPct || 0))
+      return p + "%"
+    },
+    batteryColor() {
+      const p = this.batteryPct || 0
+      if (p <= 0) return "#444444"
+      if (p < 20) return "#ff5252"
+      if (p < 50) return "#ffcc00"
+      return "#4caf50"
+    },
+    statusLine() {
+      if (this.statusText === "idle") return "waiting..."
+      if (this.statusText === "updated" || this.statusText === "ready") {
+        return "updated " + this.age + " ago"
+      }
+      return this.statusText
+    }
+  },
+
+  onInit() {
+    console.log("[inter] onInit")
+    this.startAgeTimer()
+    // автосоединение при запуске
+    this.handleCreateConn()
+  },
+
+  onDestroy() {
+    this.stopAgeTimer()
+  },
+
+  setStatus(text, cls) {
+    this.statusText = text
+    this.statusClass = cls
+    // Связанный цвет точки
+    if (cls === "status-ok") this.statusDotClass = "dot-ok"
+    else if (cls === "status-wait") this.statusDotClass = "dot-wait"
+    else if (cls === "status-err") this.statusDotClass = "dot-err"
+    else this.statusDotClass = "dot-idle"
+  },
+
+  startAgeTimer() {
+    const self = this
+    ageTimer = setInterval(function () {
+      if (!lastUpdateTs) {
+        self.age = "--"
+        return
+      }
+      const s = Math.floor((Date.now() - lastUpdateTs) / 1000)
+      if (s < 60) self.age = s + "s"
+      else if (s < 3600) self.age = Math.floor(s / 60) + "m"
+      else self.age = Math.floor(s / 3600) + "h"
+    }, 1000)
+  },
+
+  stopAgeTimer() {
+    if (ageTimer) {
+      clearInterval(ageTimer)
+      ageTimer = null
+    }
+  },
+
+  applyStatus(obj) {
+    if (!obj) return
+    if (obj.battery !== undefined) {
+      this.batteryPct = Number(obj.battery) || 0
+      this.battery = this.batteryPct + "%"
+    }
+    if (obj.network) this.network = String(obj.network)
+    if (obj.ip) this.ip = String(obj.ip)
+    lastUpdateTs = Date.now()
+  },
+
+  handleCreateConn() {
+    console.log("[inter] Connect")
+    this.setStatus("connecting", "status-wait")
+
+    try {
+      conn = interconnect.instance()
+    } catch (e) {
+      console.log("[inter] instance() threw: " + e)
+      this.setStatus("no api", "status-err")
+      return
+    }
+
+    const self = this
+
+    conn.onopen = function () {
+      console.log("[inter] onopen")
+      self.setStatus("open", "status-ok")
+    }
+
+    conn.onmessage = function (data) {
+      const payload = data && data.data
+      console.log("[inter] onmessage: " + JSON.stringify(payload))
+
+      let obj = payload
+      if (typeof payload === "string") {
+        try { obj = JSON.parse(payload) } catch (_) { obj = null }
+      }
+
+      if (obj && (obj.battery !== undefined || obj.ip || obj.network)) {
+        self.applyStatus(obj)
+        self.setStatus("updated", "status-ok")
+      } else {
+        const raw = typeof payload === "string" ? payload : JSON.stringify(payload)
+        const short = raw.length > 24 ? raw.substr(0, 24) + "…" : raw
+        self.setStatus("rx: " + short, "status-ok")
+      }
+    }
+
+    conn.onclose = function (data) {
+      console.log("[inter] onclose code=" + (data && data.code))
+      self.setStatus("closed", "status-err")
+    }
+
+    conn.onerror = function (data) {
+      console.log("[inter] onerror code=" + (data && data.code))
+      self.setStatus("error", "status-err")
+    }
+
+    conn.getReadyState({
+      success: function (data) {
+        console.log("[inter] getReadyState status=" + data.status)
+        if (data.status === 1) {
+          self.setStatus("ready", "status-ok")
+        } else {
+          self.setStatus("not paired", "status-err")
+        }
+      },
+      fail: function (data, code) {
+        console.log("[inter] getReadyState fail code=" + code)
+        self.setStatus("rs fail " + code, "status-err")
+      }
+    })
+  },
+
+  handleRequestUpdate() {
+    this.sendRequestInternal(false)
+  },
+
+  sendRequestInternal(isRetry) {
+    if (!conn) {
+      this.setStatus("no conn", "status-err")
+      this.handleCreateConn()
+      return
+    }
+    const self = this
+    const payload = { type: "get_status", t: Date.now() }
+    console.log("[inter] request: " + JSON.stringify(payload) + (isRetry ? " (retry)" : ""))
+    this.setStatus(isRetry ? "retry..." : "requesting...", "status-wait")
+    conn.send({
+      data: payload,
+      success: function () {
+        console.log("[inter] send ok")
+        self.setStatus("sent, waiting...", "status-wait")
+      },
+      fail: function (d) {
+        const code = d && d.code
+        const msg = d && d.data
+        console.log("[inter] send fail code=" + code + " msg=" + msg)
+        if (code === 202 && !isRetry) {
+          // Соединение закрылось — пересоздаём и пробуем ещё раз
+          self.setStatus("reconnecting...", "status-wait")
+          conn = null
+          setTimeout(function () {
+            self.handleCreateConn()
+            setTimeout(function () { self.sendRequestInternal(true) }, 400)
+          }, 50)
+        } else {
+          self.setStatus("tx fail " + code, "status-err")
+        }
+      }
+    })
+  }
+}
+</script>
+
+<style>
+.page {
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background-color: #0a0a0a;
+  padding-left: 14px;
+  padding-right: 14px;
+  padding-top: 32px;
+  padding-bottom: 24px;
+}
+
+/* ---- БАТАРЕЯ ---- */
+.bat-block {
+  flex-direction: column;
+  width: 100%;
+  margin-bottom: 14px;
+}
+
+.bat-header {
+  flex-direction: row;
+  align-items: center;
+  width: 100%;
+  height: 22px;
+  margin-bottom: 4px;
+}
+
+.bat-label {
+  flex: 1;
+  font-size: 11px;
+  color: #666666;
+  lines: 1;
+}
+
+.bat-value {
+  font-size: 18px;
+  color: #ffffff;
+  lines: 1;
+}
+
+.bar-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background-color: #222222;
+  flex-direction: row;
+}
+
+.bar-fill {
+  height: 6px;
+  border-radius: 3px;
+}
+
+/* ---- NETWORK / IP ---- */
+.info-block {
+  flex-direction: column;
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.info-row {
+  width: 100%;
+  height: 22px;
+  flex-direction: row;
+  align-items: center;
+  overflow: hidden;
+}
+
+.info-net {
+  width: 100%;
+  font-size: 14px;
+  color: #ffffff;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+.info-ip {
+  width: 100%;
+  font-size: 14px;
+  color: #4fc3f7;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+/* ---- STATUS ---- */
+.status-block {
+  flex-direction: row;
+  align-items: center;
+  width: 100%;
+  height: 16px;
+  margin-bottom: 8px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 3px;
+  margin-right: 6px;
+  background-color: #666666;
+}
+
+.dot-idle {
+  background-color: #666666;
+}
+
+.dot-wait {
+  background-color: #ffcc00;
+}
+
+.dot-ok {
+  background-color: #4caf50;
+}
+
+.dot-err {
+  background-color: #ff5252;
+}
+
+.status-text-box {
+  flex: 1;
+  height: 16px;
+  flex-direction: row;
+  align-items: center;
+  overflow: hidden;
+}
+
+.status-text {
+  font-size: 11px;
+  color: #888888;
+  lines: 1;
+}
+
+/* ---- КНОПКИ ---- */
+.btn-row {
+  flex-direction: column;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.btn-main {
+  width: 100%;
+  height: 36px;
+  border-radius: 18px;
+  background-color: #ff9500;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-main-text {
+  font-size: 15px;
+  color: #ffffff;
+  lines: 1;
+}
+
+.btn-ghost {
+  width: 100%;
+  height: 28px;
+  border-radius: 14px;
+  background-color: #1a1a1a;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  margin-top: 6px;
+}
+
+.btn-ghost-text {
+  font-size: 12px;
+  color: #888888;
+  lines: 1;
+}
+</style>
