@@ -7,7 +7,9 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.xiaomi.xms.wearable.Wearable
@@ -31,8 +33,9 @@ import java.util.concurrent.ConcurrentHashMap
  *  - дожидается пока Mi Fitness/Xiaomi Wear (xms service) будет привязан;
  *  - получает did подключённых часов;
  *  - запрашивает DEVICE_MANAGER + NOTIFY (если ещё не выдано);
- *  - вешает MessageApi.addListener на каждый node;
+ *  - вешает MessageApi.addListener ТОЛЬКО после того, как permissions подтверждены;
  *  - при приходе {"type":"get_status"} собирает battery/ip/network и шлёт обратно;
+ *  - после каждого входящего — перевешивает listener (защита от «молча умершего» биндера);
  *  - слушает ITEM_CONNECTION — перевешивает listener при реконнекте часов.
  *
  * Запускается из MainActivity через ContextCompat.startForegroundService(...).
@@ -46,6 +49,12 @@ class InterconnectService : Service() {
 
         const val ACTION_START = "com.xiaomi.xms.wearable.demo.START"
         const val ACTION_STOP = "com.xiaomi.xms.wearable.demo.STOP"
+
+        /** Как часто опрашивать permissions, пока пользователь листает диалог Mi Fitness. */
+        private const val PERM_RETRY_MS = 2_000L
+
+        /** Сколько ждать, прежде чем сдаться (логически — пользователь проигнорировал диалог). */
+        private const val PERM_RETRY_MAX_MS = 60_000L
     }
 
     private var nodeApi: NodeApi? = null
@@ -56,10 +65,15 @@ class InterconnectService : Service() {
     /** did -> listener (listener'ов может быть несколько — по одному на каждый node) */
     private val listeners = ConcurrentHashMap<String, OnMessageReceivedListener>()
 
-    /** Нужно помнить, какие did уже подписаны на ITEM_CONNECTION, чтобы не дублировать */
+    /** Какие did уже подписаны на ITEM_CONNECTION (чтобы не дублировать подписку). */
     private val connectionSubscribed = ConcurrentHashMap.newKeySet<String>()
 
+    /** Для какого did уже идёт цикл ожидания permissions (чтобы не плодить Handler'ов). */
+    private val pendingPermWaits = ConcurrentHashMap.newKeySet<String>()
+
     @Volatile private var started = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -94,6 +108,7 @@ class InterconnectService : Service() {
                     // listener'ы на той стороне протухают, сбросим кэш — перевесим при реконнекте.
                     listeners.clear()
                     connectionSubscribed.clear()
+                    pendingPermWaits.clear()
                 }
             })
             // Первая попытка сразу — часто сервис уже привязан к моменту запуска.
@@ -104,12 +119,14 @@ class InterconnectService : Service() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
         for ((did, _) in listeners) {
             runCatching { messageApi?.removeListener(did) }
             runCatching { nodeApi?.unsubscribe(did, DataItem.ITEM_CONNECTION) }
         }
         listeners.clear()
         connectionSubscribed.clear()
+        pendingPermWaits.clear()
         super.onDestroy()
     }
 
@@ -179,28 +196,53 @@ class InterconnectService : Service() {
         val did = node.id
         Log.d(TAG, "setupNode did=$did name=${node.name}")
 
-        // 1) Убедимся, что у нас есть нужные права. Если их нет — запросим.
-        //    requestPermission НЕ рисует UI автоматически в нашем service-контексте;
-        //    он показывает системный диалог от Mi Fitness. Если пользователь ещё
-        //    не выдавал права — лучше вызвать requestPermission из MainActivity первый раз.
-        authApi?.checkPermissions(did, arrayOf(Permission.DEVICE_MANAGER, Permission.NOTIFY))
-            ?.addOnSuccessListener { granted ->
+        // Подписка на ITEM_CONNECTION — можно делать сразу, не требует DEVICE_MANAGER/NOTIFY
+        // (перевешивание listener'а делаем, когда часы реконнектятся).
+        subscribeConnection(did)
+
+        // Listener вешаем ТОЛЬКО после подтверждения permissions.
+        // Если их пока нет — стартуем вежливый опрос с экспоненциальным back-off'ом.
+        ensurePermissionsThenAttach(did, elapsedMs = 0L)
+    }
+
+    /**
+     * Периодически проверяет permissions для [did]; когда DEVICE_MANAGER + NOTIFY выданы —
+     * вешает listener. Если за [PERM_RETRY_MAX_MS] не выданы — всё равно пытается повесить
+     * listener (на некоторых прошивках NOTIFY не обязателен), и сдаётся.
+     */
+    private fun ensurePermissionsThenAttach(did: String, elapsedMs: Long) {
+        if (!pendingPermWaits.add(did) && elapsedMs == 0L) {
+            // Для этого did уже крутится ожидание — не плодим.
+            return
+        }
+        val aApi = authApi ?: run {
+            pendingPermWaits.remove(did)
+            return
+        }
+
+        aApi.checkPermissions(did, arrayOf(Permission.DEVICE_MANAGER, Permission.NOTIFY))
+            .addOnSuccessListener { granted ->
                 val allOk = granted != null && granted.size >= 2 && granted[0] && granted[1]
-                Log.d(TAG, "perms check did=$did granted=${granted?.toList()}")
+                Log.d(TAG, "perms check did=$did elapsed=${elapsedMs}ms granted=${granted?.toList()}")
                 if (allOk) {
+                    pendingPermWaits.remove(did)
                     attachMessageListener(did)
-                    subscribeConnection(did)
+                } else if (elapsedMs >= PERM_RETRY_MAX_MS) {
+                    // Время вышло. Всё равно вешаем — хуже не будет, на некоторых прошивках
+                    // NOTIFY не требуется, а без listener'а смысла в сервисе нет.
+                    Log.w(TAG, "perms still missing after ${elapsedMs}ms; attaching listener anyway")
+                    pendingPermWaits.remove(did)
+                    attachMessageListener(did)
                 } else {
-                    Log.w(TAG, "permissions not granted yet — user should open MainActivity once")
-                    // Всё равно попробуем — на некоторых прошивках listener работает и без NOTIFY.
-                    attachMessageListener(did)
-                    subscribeConnection(did)
+                    mainHandler.postDelayed({
+                        ensurePermissionsThenAttach(did, elapsedMs + PERM_RETRY_MS)
+                    }, PERM_RETRY_MS)
                 }
             }
-            ?.addOnFailureListener { e ->
-                Log.w(TAG, "checkPermissions failed: ${e.message}")
+            .addOnFailureListener { e ->
+                Log.w(TAG, "checkPermissions failed did=$did: ${e.message}; attaching listener anyway")
+                pendingPermWaits.remove(did)
                 attachMessageListener(did)
-                subscribeConnection(did)
             }
     }
 
@@ -209,7 +251,7 @@ class InterconnectService : Service() {
 
         val listener = OnMessageReceivedListener { nodeId, bytes ->
             val text = try { String(bytes, Charsets.UTF_8) } catch (_: Throwable) { "<bin>" }
-            Log.d(TAG, "RX did=$nodeId size=${bytes.size} text=$text")
+            Log.d(TAG, "RX did=$nodeId size=${bytes.size} hex=${bytes.toHexPreview()} text=$text")
             handleIncoming(nodeId, text)
         }
         listeners[did] = listener
@@ -224,6 +266,22 @@ class InterconnectService : Service() {
             }
     }
 
+    /**
+     * Снять и заново повесить listener на [did]. Вызывается после каждого обработанного
+     * входящего — защита от «молча умершего» xms-биндера, который может перестать отдавать
+     * пакеты листенеру без каких-либо колбэков.
+     */
+    private fun reattachMessageListener(did: String) {
+        val mApi = messageApi ?: return
+        val old = listeners.remove(did)
+        if (old != null) {
+            mApi.removeListener(did)
+                .addOnSuccessListener { Log.d(TAG, "removeListener ok did=$did (pre-reattach)") }
+                .addOnFailureListener { Log.w(TAG, "removeListener failed did=$did: ${it.message}") }
+        }
+        attachMessageListener(did)
+    }
+
     private fun subscribeConnection(did: String) {
         if (!connectionSubscribed.add(did)) return
         nodeApi?.subscribe(did, DataItem.ITEM_CONNECTION) { nodeId, item, data ->
@@ -232,8 +290,7 @@ class InterconnectService : Service() {
             Log.d(TAG, "connection change did=$nodeId status=$status")
             if (status == DataSubscribeResult.RESULT_CONNECTION_CONNECTED) {
                 // Часы вернулись — listener мог протухнуть, перевесим.
-                listeners.remove(nodeId)
-                attachMessageListener(nodeId)
+                reattachMessageListener(nodeId)
             } else {
                 // Часы ушли — чистим кэш listener'а, при следующем реконнекте перевесим.
                 listeners.remove(nodeId)
@@ -254,6 +311,11 @@ class InterconnectService : Service() {
                 rawText.contains("refresh", ignoreCase = true)
 
         respondStatus(did, forceRefreshIp = forceIp, replyTo = type)
+
+        // Защитное перевешивание listener'а после каждого обработанного сообщения:
+        // на ряде прошивок xms-биндер молча перестаёт отдавать последующие пакеты,
+        // если этого не делать, — симптом выглядит как «работает только первый Refresh».
+        reattachMessageListener(did)
     }
 
     private fun respondStatus(did: String, forceRefreshIp: Boolean, replyTo: String) {
@@ -263,14 +325,29 @@ class InterconnectService : Service() {
             if (replyTo.isNotEmpty()) {
                 statusJson.put("reply_to", replyTo)
             }
-            val payload = statusJson.toString().toByteArray(Charsets.UTF_8)
+            val raw = statusJson.toString()
+            val payload = raw.toByteArray(Charsets.UTF_8)
+            Log.d(TAG, "TX did=$did size=${payload.size} hex=${payload.toHexPreview()} json=$raw")
             messageApi?.sendMessage(did, payload)
                 ?.addOnSuccessListener {
-                    Log.d(TAG, "TX did=$did ok json=$statusJson")
+                    Log.d(TAG, "TX did=$did ok")
                 }
                 ?.addOnFailureListener { e ->
                     Log.w(TAG, "TX did=$did failed: ${e.message}")
                 }
         }.start()
     }
+}
+
+/** Короткое hex-превью (первые 32 байта) — для logcat'а, чтобы видеть реальный трафик. */
+private fun ByteArray.toHexPreview(limit: Int = 32): String {
+    if (isEmpty()) return "<empty>"
+    val end = minOf(size, limit)
+    val sb = StringBuilder(end * 3)
+    for (i in 0 until end) {
+        if (i > 0) sb.append(' ')
+        sb.append(String.format("%02x", this[i].toInt() and 0xff))
+    }
+    if (size > limit) sb.append(" …(+${size - limit})")
+    return sb.toString()
 }
