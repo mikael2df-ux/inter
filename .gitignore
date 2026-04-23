@@ -1,7 +1,29 @@
+# Node
+/node_modules
 /.nyc_output
 /coverage
-/node_modules
-/sign
-/dist
+
+# Build output (часовое приложение)
 /build
+/dist
+/sign
+
+# Гит-хуки
 .husky/
+
+# IDE
+.idea/
+.vscode/
+
+# Android build output
+**/build/
+**/.gradle/
+**/local.properties
+
+# Бинарные артефакты (собираются, не коммитятся)
+*.apk
+*.rpk
+
+# OS
+.DS_Store
+Thumbs.db

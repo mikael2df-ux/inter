@@ -368,20 +368,19 @@ conn.onmessage = (d) => {
 
 ---
 
-## 8. Lint / husky
+## 8. Lint
 
 ```powershell
-./husky.sh         # один раз, после git init
 npm run lint       # ручной прогон
 ```
 
-`lint-staged` из `package.json` автоматически гоняет `prettier` + `eslint` +
-`stylelint` на `.ux/.js/.css/.less` при коммите.
+Хуков и `lint-staged` нет — линт гоняется вручную.
 
 ---
 
 ## Полезные ссылки
 
 - Официальная документация quickapp Mi Vela: <https://iot.mi.com/vela/quickapp>
-- PDF-документация по Xiaomi Wearable SDK (в корне проекта):
-  `小米穿戴第三方APP能力开放接口文档_1.4.pdf` и `doc.pdf`.
+- PDF-документация по Xiaomi Wearable SDK лежит в `demo/` (файлы
+  `小米穿戴第三方APP能力开放接口文档_1.4.pdf` и `interconnect测.pdf`) и
+  дублируется в `demoforanaly/` для оригинального референса.
