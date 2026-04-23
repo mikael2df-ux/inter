@@ -47,6 +47,11 @@ import interconnect from "@system.interconnect"
 let conn = null
 let lastUpdateTs = 0
 let ageTimer = null
+// Ожидание ответа на последний send: если за REPLY_TIMEOUT_MS не пришёл ответ —
+// пересоздаём conn и повторяем запрос.
+let pendingReplyTimer = null
+let pendingSentAt = 0
+const REPLY_TIMEOUT_MS = 2000
 
 export default {
   private: {
@@ -90,6 +95,7 @@ export default {
 
   onDestroy() {
     this.stopAgeTimer()
+    this.clearPendingReplyTimer()
   },
 
   setStatus(text, cls) {
@@ -155,7 +161,9 @@ export default {
 
     conn.onmessage = function (data) {
       const payload = data && data.data
-      console.log("[inter] onmessage: " + JSON.stringify(payload))
+      const rtt = pendingSentAt ? (Date.now() - pendingSentAt) : -1
+      console.log("[inter] onmessage rtt=" + rtt + "ms payload=" + JSON.stringify(payload))
+      self.clearPendingReplyTimer()
 
       let obj = payload
       if (typeof payload === "string") {
@@ -202,6 +210,34 @@ export default {
     this.sendRequestInternal(false)
   },
 
+  clearPendingReplyTimer() {
+    if (pendingReplyTimer) {
+      clearTimeout(pendingReplyTimer)
+      pendingReplyTimer = null
+    }
+    pendingSentAt = 0
+  },
+
+  armPendingReplyTimer(isRetry) {
+    const self = this
+    this.clearPendingReplyTimer()
+    pendingSentAt = Date.now()
+    pendingReplyTimer = setTimeout(function () {
+      pendingReplyTimer = null
+      console.log("[inter] reply timeout after " + REPLY_TIMEOUT_MS + "ms (retry=" + isRetry + ")")
+      if (isRetry) {
+        self.setStatus("no reply", "status-err")
+        return
+      }
+      self.setStatus("timeout, reconnecting...", "status-wait")
+      conn = null
+      setTimeout(function () {
+        self.handleCreateConn()
+        setTimeout(function () { self.sendRequestInternal(true) }, 400)
+      }, 50)
+    }, REPLY_TIMEOUT_MS)
+  },
+
   sendRequestInternal(isRetry) {
     if (!conn) {
       this.setStatus("no conn", "status-err")
@@ -209,19 +245,24 @@ export default {
       return
     }
     const self = this
-    const payload = { type: "get_status", t: Date.now() }
-    console.log("[inter] request: " + JSON.stringify(payload) + (isRetry ? " (retry)" : ""))
+    const payloadObj = { type: "get_status", t: Date.now() }
+    // Шлём JSON-строкой: на некоторых сборках Vela объект в `data` уходит как
+    // "[object Object]"; строка однозначна и телефон уже парсит её как JSON.
+    const payload = JSON.stringify(payloadObj)
+    console.log("[inter] request t=" + payloadObj.t + (isRetry ? " (retry)" : "") + " payload=" + payload)
     this.setStatus(isRetry ? "retry..." : "requesting...", "status-wait")
     conn.send({
       data: payload,
       success: function () {
-        console.log("[inter] send ok")
+        console.log("[inter] send ok t=" + payloadObj.t)
         self.setStatus("sent, waiting...", "status-wait")
+        self.armPendingReplyTimer(isRetry)
       },
       fail: function (d) {
         const code = d && d.code
         const msg = d && d.data
         console.log("[inter] send fail code=" + code + " msg=" + msg)
+        self.clearPendingReplyTimer()
         if (code === 202 && !isRetry) {
           // Соединение закрылось — пересоздаём и пробуем ещё раз
           self.setStatus("reconnecting...", "status-wait")
